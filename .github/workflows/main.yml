@@ -8,7 +8,7 @@ permissions:
 
 concurrency:
   group: braincells-tool-wielder
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   tool-wielder:
@@ -16,1106 +16,294 @@ jobs:
     timeout-minutes: 350
 
     env:
-      # Lightweight agent.
       TOOL_MODEL: qwen3:1.7b
-
-      # Local Ollama.
       OLLAMA_HOST: 127.0.0.1:11434
       OLLAMA_KEEP_ALIVE: 24h
-
-      # Tool Wielder API.
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
       TOOL_HOST: 0.0.0.0
       TOOL_PORT: "8765"
-
-      # Persistent memory file.
       MEMORY_FILE: data/tool_memory.jsonl
-
-      # Shared secret between Main Agent and Tool Wielder.
+      COMMAND_TIMEOUT: "180"
+      MAX_BODY: "2097152"
+      MAX_READ: "262144"
+      MAX_WEB_BYTES: "786432"
+      WEB_CACHE_TTL: "45"
+      WORKSPACE: ${{ github.workspace }}
       TOOL_WIELDER_KEY: ${{ secrets.TOOL_WIELDER_KEY }}
 
-      # GitHub token used to persist memory.
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
     steps:
-
-      # ------------------------------------------------------------
-      # CHECKOUT
-      # ------------------------------------------------------------
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
 
-      # ------------------------------------------------------------
-      # TAILSCALE
-      # ------------------------------------------------------------
-      - name: Connect Tailscale
+      - name: Install system tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y curl jq tree ripgrep python3
+
+      - name: Install Tailscale
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
-          log-mode: quiet
+          args: --hostname=braincells-tool-wielder-${{ github.run_id }}
+          version: latest
 
-      - name: Show Tool Wielder address
+      - name: Show Tailscale endpoint
         shell: bash
         run: |
+          set -euo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n1)"
+
           echo "========================================"
           echo " TOOL WIELDER ONLINE"
           echo "========================================"
+
           echo "Tailscale IPv4:"
-          tailscale ip -4
+          echo "$TS_IP"
           echo
+
           echo "Tailnet status:"
-          tailscale status
+          tailscale status || true
           echo
-          echo "API: http://$(tailscale ip -4):8765"
+
+          echo "API: http://${TS_IP}:${TOOL_PORT}"
           echo "========================================"
 
-      # ------------------------------------------------------------
-      # SYSTEM PACKAGES
-      # ------------------------------------------------------------
-      - name: Install dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            curl \
-            jq \
-            tree \
-            ripgrep \
-            python3
+          echo "TOOL_WIELDER_IP=${TS_IP}" >> "$GITHUB_ENV"
 
-      # ------------------------------------------------------------
-      # OLLAMA
-      # ------------------------------------------------------------
       - name: Install Ollama
         shell: bash
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
+          set -euo pipefail
+
+          if ! command -v ollama >/dev/null 2>&1; then
+            curl -fsSL https://ollama.com/install.sh | sh
+          fi
+
+          ollama --version
 
       - name: Start Ollama
         shell: bash
         run: |
-          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          set -euo pipefail
+
+          nohup env \
+            OLLAMA_HOST="$OLLAMA_HOST" \
+            OLLAMA_KEEP_ALIVE="$OLLAMA_KEEP_ALIVE" \
+            OLLAMA_NUM_PARALLEL="$OLLAMA_NUM_PARALLEL" \
+            OLLAMA_MAX_LOADED_MODELS="$OLLAMA_MAX_LOADED_MODELS" \
+            ollama serve \
+            > /tmp/ollama.log 2>&1 &
 
           for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              echo "Ollama is ready."
+            if curl -fsS \
+              "http://${OLLAMA_HOST}/api/tags" \
+              >/dev/null 2>&1; then
               break
             fi
+
             sleep 1
           done
 
-          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
+          curl -fsS \
+            "http://${OLLAMA_HOST}/api/tags" \
+            >/dev/null
 
-      # ------------------------------------------------------------
-      # PULL LIGHTWEIGHT TOOL MODEL
-      # ------------------------------------------------------------
-      - name: Pull tool model
+          echo "✓ Ollama online"
+
+      - name: Pull Tool Wielder model
         shell: bash
         run: |
+          set -euo pipefail
+
           ollama pull "$TOOL_MODEL"
 
-          echo
-          echo "Installed model:"
-          ollama list
+          echo "✓ $TOOL_MODEL available"
 
-      # ------------------------------------------------------------
-      # PREPARE MEMORY
-      # ------------------------------------------------------------
-      - name: Prepare memory
-        shell: bash
+      - name: Patch and validate Tool Wielder /warm endpoint
+        shell: python3 {0}
         run: |
-          mkdir -p "$(dirname "$MEMORY_FILE")"
-          touch "$MEMORY_FILE"
-
-          echo "Memory file: $MEMORY_FILE"
-          wc -l "$MEMORY_FILE" || true
-
-      # ------------------------------------------------------------
-      # CREATE TOOL WIELDER SERVER
-      # ------------------------------------------------------------
-      - name: Build Tool Wielder
-        shell: bash
-        run: |
-          cat > tool_wielder.py <<'PY'
-          import os
-          import re
-          import json
-          import time
-          import signal
-          import threading
-          import subprocess
-          import urllib.request
-          import urllib.error
-          from datetime import datetime, timezone
-          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
           from pathlib import Path
+          import sys
 
-          # ============================================================
-          # CONFIG
-          # ============================================================
+          path = Path("tool_wielder.py")
 
-          MODEL = os.environ.get("TOOL_MODEL", "qwen3:1.7b")
-          OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-
-          HOST = os.environ.get("TOOL_HOST", "0.0.0.0")
-          PORT = int(os.environ.get("TOOL_PORT", "8765"))
-
-          ROOT = Path(os.environ.get("GITHUB_WORKSPACE", os.getcwd())).resolve()
-          MEMORY_FILE = ROOT / os.environ.get(
-              "MEMORY_FILE",
-              "data/tool_memory.jsonl"
-          )
-
-          API_KEY = os.environ.get("TOOL_WIELDER_KEY", "")
-
-          MAX_COMMANDS = 4
-          DEFAULT_TIMEOUT = 45
-          MAX_TIMEOUT = 120
-          MAX_OUTPUT = 24000
-
-          MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-          MEMORY_FILE.touch(exist_ok=True)
-
-          # ============================================================
-          # STATE
-          # ============================================================
-
-          memory_lock = threading.Lock()
-          git_lock = threading.Lock()
-
-          memories = []
-          memory_dirty = False
-
-          # ============================================================
-          # MEMORY
-          # ============================================================
-
-          def load_memories():
-              global memories
-
-              loaded = []
-
-              try:
-                  with MEMORY_FILE.open(
-                      "r",
-                      encoding="utf-8",
-                      errors="replace"
-                  ) as f:
-                      for line in f:
-                          line = line.strip()
-
-                          if not line:
-                              continue
-
-                          try:
-                              item = json.loads(line)
-
-                              if isinstance(item, dict):
-                                  loaded.append(item)
-                          except Exception:
-                              continue
-
-              except Exception:
-                  pass
-
-              with memory_lock:
-                  memories = loaded
-
-
-          def tokenize(text):
-              return set(
-                  x.lower()
-                  for x in re.findall(r"[A-Za-z0-9_./:-]{3,}", text or "")
+          if not path.exists():
+              raise SystemExit(
+                  "tool_wielder.py not found in repository root"
               )
 
+          text = path.read_text(encoding="utf-8")
 
-          def retrieve_memories(query, limit=6):
-              q = tokenize(query)
+          # Add /warm only when it doesn't already exist.
+          if 'self.path == "/warm"' not in text:
 
-              with memory_lock:
-                  items = list(memories)
+              marker = '''        if self.path == "/health":\n'''
 
-              scored = []
-
-              for item in items:
-                  text = str(item.get("memory", ""))
-                  tags = item.get("tags", [])
-
-                  blob = text + " " + " ".join(map(str, tags))
-                  tokens = tokenize(blob)
-
-                  overlap = len(q & tokens)
-
-                  if overlap == 0:
-                      continue
-
-                  importance = float(item.get("importance", 1.0))
-
-                  try:
-                      ts = float(item.get("timestamp_epoch", 0))
-                  except Exception:
-                      ts = 0
-
-                  age_days = max(
-                      0,
-                      (time.time() - ts) / 86400
+              if marker not in text:
+                  raise SystemExit(
+                      "Could not locate Handler.do_GET() /health "
+                      "route in tool_wielder.py"
                   )
 
-                  recency = 1.0 / (1.0 + age_days)
+              warm_block = '''        if self.path == "/warm":
+            # Authenticated warm-up request.
+            # Sends a tiny request to Ollama and keeps Qwen loaded.
+            try:
+                qwen.post_json("/api/chat", {
+                    "model": QWEN_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "ping"
+                        }
+                    ],
+                    "stream": False,
+                    "think": False,
+                    "keep_alive": QWEN_KEEP_ALIVE,
+                    "options": {
+                        "num_ctx": 256,
+                        "num_predict": 1,
+                        "temperature": 0
+                    }
+                })
 
-                  score = (
-                      overlap * 5.0
-                      + importance
-                      + recency
-                  )
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "model": QWEN_MODEL,
+                        "warmed": True
+                    }
+                )
 
-                  scored.append((score, item))
+            except Exception as exc:
+                self._json(
+                    502,
+                    {
+                        "ok": False,
+                        "error": (
+                            f"warm failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    }
+                )
 
-              scored.sort(
-                  key=lambda x: x[0],
-                  reverse=True
+            return
+'''
+
+              text = text.replace(
+                  marker,
+                  warm_block + marker,
+                  1
               )
 
-              return [
-                  item
-                  for _, item in scored[:max(1, min(limit, 12))]
-              ]
-
-
-          def store_memory(memory_text, tags=None, importance=1.0):
-              global memory_dirty
-
-              memory_text = str(memory_text).strip()
-
-              if not memory_text:
-                  raise ValueError("Empty memory.")
-
-              tags = tags or []
-
-              item = {
-                  "id": f"mem_{int(time.time() * 1000)}",
-                  "timestamp": datetime.now(
-                      timezone.utc
-                  ).isoformat(),
-                  "timestamp_epoch": time.time(),
-                  "memory": memory_text[:8000],
-                  "tags": [str(x)[:64] for x in tags[:16]],
-                  "importance": max(
-                      0.0,
-                      min(float(importance), 10.0)
-                  )
-              }
-
-              encoded = json.dumps(
-                  item,
-                  ensure_ascii=False
+              path.write_text(
+                  text,
+                  encoding="utf-8"
               )
 
-              with memory_lock:
-                  with MEMORY_FILE.open(
-                      "a",
-                      encoding="utf-8"
-                  ) as f:
-                      f.write(encoded + "\n")
-                      f.flush()
-
-                  memories.append(item)
-                  memory_dirty = True
-
-              # Persistence happens in the background.
-              threading.Thread(
-                  target=git_sync,
-                  daemon=True
-              ).start()
-
-              return item
-
-
-          # ============================================================
-          # OLLAMA
-          # ============================================================
-
-          def ask_tool_model(instruction, context=""):
-              system = r"""
-          You are the TOOL WIELDER.
-
-          You are NOT the main assistant.
-          You do NOT talk to the user.
-          You do NOT explain your reasoning.
-          You do NOT make final decisions for the overall task.
-
-          Your job is to convert the Main Agent's instruction into
-          one or more precise tool actions.
-
-          You may:
-          - inspect files
-          - use cat
-          - use tree
-          - use ls
-          - use find
-          - use rg/grep
-          - use sed/head/tail
-          - inspect git state
-          - run development commands
-          - retrieve memories
-          - store memories
-
-          Return JSON ONLY.
-
-          For execution:
-          {
-            "actions": [
-              {
-                "tool": "shell",
-                "command": "cat path/to/file",
-                "cwd": ".",
-                "timeout": 30
-              }
-            ]
-          }
-
-          For memory retrieval:
-          {
-            "action": "memory_retrieve",
-            "query": "important search terms",
-            "limit": 6
-          }
-
-          For memory storage:
-          {
-            "action": "memory_store",
-            "memory": "clean durable memory",
-            "tags": ["tag1", "tag2"],
-            "importance": 5
-          }
-
-          Prefer the smallest number of commands necessary.
-
-          Never invent command output.
-          Never claim something was executed when it wasn't.
-          """
-
-              user = {
-                  "instruction": instruction,
-                  "context": context[-12000:]
-              }
-
-              payload = {
-                  "model": MODEL,
-                  "messages": [
-                      {
-                          "role": "system",
-                          "content": system
-                      },
-                      {
-                          "role": "user",
-                          "content": json.dumps(
-                              user,
-                              ensure_ascii=False
-                          )
-                      }
-                  ],
-                  "stream": False,
-                  "think": False,
-                  "format": "json",
-                  "keep_alive": "24h",
-                  "options": {
-                      "num_ctx": 2048,
-                      "num_predict": 220,
-                      "temperature": 0.1,
-                      "top_p": 0.9
-                  }
-              }
-
-              body = json.dumps(payload).encode()
-
-              request = urllib.request.Request(
-                  OLLAMA_URL,
-                  data=body,
-                  headers={
-                      "Content-Type": "application/json"
-                  },
-                  method="POST"
+              print(
+                  "✓ Added authenticated GET /warm "
+                  "to tool_wielder.py"
               )
 
-              with urllib.request.urlopen(
-                  request,
-                  timeout=60
-              ) as response:
-                  raw = response.read().decode(
-                      "utf-8",
-                      errors="replace"
-                  )
+          else:
+              print("✓ /warm already exists in tool_wielder.py")
 
-              data = json.loads(raw)
-
-              content = (
-                  data.get("message", {})
-                      .get("content", "")
-                      .strip()
+          # Make sure the worker actually uses the secret.
+          if "TOOL_WIELDER_KEY" not in text:
+              raise SystemExit(
+                  "tool_wielder.py does not reference "
+                  "TOOL_WIELDER_KEY"
               )
 
-              if not content:
-                  raise RuntimeError(
-                      "Tool model returned empty output."
-                  )
-
-              try:
-                  return json.loads(content)
-              except Exception:
-                  # Small recovery for accidental surrounding text.
-                  match = re.search(
-                      r"\{.*\}",
-                      content,
-                      re.DOTALL
-                  )
-
-                  if not match:
-                      raise RuntimeError(
-                          "Tool model returned invalid JSON."
-                      )
-
-                  return json.loads(match.group(0))
-
-
-          # ============================================================
-          # COMMAND GUARD
-          # ============================================================
-
-          # This is deliberately workspace-focused instead of exposing
-          # the hosted runner's entire machine and secrets to an agent.
-
-          BLOCKED_PATTERNS = [
-              r"\brm\s+-rf\s+/$",
-              r"\brm\s+-rf\s+/\*",
-              r"\bmkfs(\.|$|\s)",
-              r"\bdd\s+if=.*\bof=/dev/",
-              r"\bshutdown\b",
-              r"\breboot\b",
-              r"\bpoweroff\b",
-              r"\b:(){.*};:",
-              r"/etc/shadow",
-              r"/etc/sudoers",
-              r"/root/",
-              r"/home/runner/\.ssh/",
-              r"/proc/",
-              r"/sys/",
-              r"/dev/",
-              r"\.\./",
-              r"\bGITHUB_TOKEN\b",
-          ]
-
-          def command_allowed(command):
-              lowered = command.lower()
-
-              for pattern in BLOCKED_PATTERNS:
-                  if re.search(pattern, lowered):
-                      return False, (
-                          "Command blocked by Tool Wielder safety guard: "
-                          + pattern
-                      )
-
-              return True, ""
-
-
-          # ============================================================
-          # SHELL EXECUTION
-          # ============================================================
-
-          def run_shell(command, cwd=".", timeout=DEFAULT_TIMEOUT):
-              command = str(command).strip()
-
-              allowed, reason = command_allowed(command)
-
-              if not allowed:
-                  return {
-                      "status": "blocked",
-                      "command": command,
-                      "exit_code": None,
-                      "stdout": "",
-                      "stderr": reason,
-                      "duration_ms": 0
-                  }
-
-              try:
-                  timeout = int(timeout)
-              except Exception:
-                  timeout = DEFAULT_TIMEOUT
-
-              timeout = max(
-                  1,
-                  min(timeout, MAX_TIMEOUT)
-              )
-
-              workdir = (ROOT / str(cwd)).resolve()
-
-              try:
-                  workdir.relative_to(ROOT)
-              except ValueError:
-                  return {
-                      "status": "blocked",
-                      "command": command,
-                      "exit_code": None,
-                      "stdout": "",
-                      "stderr": "cwd escapes workspace.",
-                      "duration_ms": 0
-                  }
-
-              if not workdir.exists():
-                  return {
-                      "status": "error",
-                      "command": command,
-                      "exit_code": None,
-                      "stdout": "",
-                      "stderr": f"cwd does not exist: {workdir}",
-                      "duration_ms": 0
-                  }
-
-              safe_env = {
-                  "PATH": os.environ.get("PATH", ""),
-                  "HOME": "/tmp/tool-wielder-home",
-                  "LANG": "C.UTF-8",
-                  "LC_ALL": "C.UTF-8",
-                  "PWD": str(workdir),
-                  "GITHUB_WORKSPACE": str(ROOT)
-              }
-
-              os.makedirs(
-                  safe_env["HOME"],
-                  exist_ok=True
-              )
-
-              started = datetime.now(
-                  timezone.utc
-              ).isoformat()
-
-              start_time = time.perf_counter()
-
-              process = subprocess.Popen(
-                  [
-                      "bash",
-                      "-lc",
-                      "cd -- \"$WORKSPACE_DIR\" && " + command
-                  ],
-                  cwd=str(workdir),
-                  env={
-                      **safe_env,
-                      "WORKSPACE_DIR": str(workdir)
-                  },
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.PIPE,
-                  text=True,
-                  errors="replace"
-              )
-
-              try:
-                  stdout, stderr = process.communicate(
-                      timeout=timeout
-                  )
-
-                  status = (
-                      "success"
-                      if process.returncode == 0
-                      else "error"
-                  )
-
-              except subprocess.TimeoutExpired:
-                  process.kill()
-
-                  stdout, stderr = process.communicate()
-
-                  status = "timeout"
-
-              duration_ms = int(
-                  (time.perf_counter() - start_time) * 1000
-              )
-
-              return {
-                  "status": status,
-                  "command": command,
-                  "cwd": str(workdir.relative_to(ROOT)),
-                  "pid": process.pid,
-                  "started_at": started,
-                  "finished_at": datetime.now(
-                      timezone.utc
-                  ).isoformat(),
-                  "exit_code": process.returncode,
-                  "stdout": stdout[:MAX_OUTPUT],
-                  "stderr": stderr[:MAX_OUTPUT],
-                  "stdout_truncated": len(stdout) > MAX_OUTPUT,
-                  "stderr_truncated": len(stderr) > MAX_OUTPUT,
-                  "duration_ms": duration_ms
-              }
-
-
-          # ============================================================
-          # REQUEST DISPATCH
-          # ============================================================
-
-          def execute_request(body):
-              kind = body.get("kind", "execute")
-              task_id = body.get(
-                  "task_id",
-                  f"task_{int(time.time() * 1000)}"
-              )
-
-              instruction = str(
-                  body.get("instruction", "")
-              ).strip()
-
-              context = str(
-                  body.get("context", "")
-              )
-
-              if not instruction:
-                  return {
-                      "ok": False,
-                      "error": "Missing instruction."
-                  }
-
-              # --------------------------------------------------------
-              # EXECUTION
-              # --------------------------------------------------------
-
-              if kind == "execute":
-                  plan = ask_tool_model(
-                      instruction,
-                      context
-                  )
-
-                  actions = plan.get("actions", [])
-
-                  if not isinstance(actions, list):
-                      return {
-                          "ok": False,
-                          "task_id": task_id,
-                          "error": "Tool model produced no action list.",
-                          "model_plan": plan
-                      }
-
-                  actions = actions[:MAX_COMMANDS]
-
-                  results = []
-
-                  for action in actions:
-                      if not isinstance(action, dict):
-                          continue
-
-                      if action.get("tool") != "shell":
-                          results.append({
-                              "status": "error",
-                              "error": "Unsupported tool."
-                          })
-                          continue
-
-                      result = run_shell(
-                          action.get("command", ""),
-                          action.get("cwd", "."),
-                          action.get(
-                              "timeout",
-                              DEFAULT_TIMEOUT
-                          )
-                      )
-
-                      results.append(result)
-
-                      # Stop after a failed command so the Main Agent
-                      # gets to decide what happens next.
-                      if result.get("status") != "success":
-                          break
-
-                  return {
-                      "ok": True,
-                      "task_id": task_id,
-                      "kind": "execute",
-                      "instruction": instruction,
-                      "model_plan": plan,
-                      "results": results
-                  }
-
-              # --------------------------------------------------------
-              # MEMORY RETRIEVAL
-              # --------------------------------------------------------
-
-              if kind == "memory_retrieve":
-                  plan = ask_tool_model(
-                      instruction,
-                      context
-                  )
-
-                  query = str(
-                      plan.get("query", instruction)
-                  )
-
-                  try:
-                      limit = int(
-                          plan.get("limit", 6)
-                      )
-                  except Exception:
-                      limit = 6
-
-                  found = retrieve_memories(
-                      query,
-                      limit
-                  )
-
-                  return {
-                      "ok": True,
-                      "task_id": task_id,
-                      "kind": "memory_retrieve",
-                      "query": query,
-                      "memories": found
-                  }
-
-              # --------------------------------------------------------
-              # MEMORY STORAGE
-              # --------------------------------------------------------
-
-              if kind == "memory_store":
-                  plan = ask_tool_model(
-                      instruction,
-                      context
-                  )
-
-                  memory_text = str(
-                      plan.get("memory", "")
-                  ).strip()
-
-                  if not memory_text:
-                      return {
-                          "ok": False,
-                          "task_id": task_id,
-                          "error": "Model did not produce a memory."
-                      }
-
-                  item = store_memory(
-                      memory_text,
-                      plan.get("tags", []),
-                      plan.get("importance", 1)
-                  )
-
-                  return {
-                      "ok": True,
-                      "task_id": task_id,
-                      "kind": "memory_store",
-                      "stored": item
-                  }
-
-              return {
-                  "ok": False,
-                  "task_id": task_id,
-                  "error": f"Unknown kind: {kind}"
-              }
-
-
-          # ============================================================
-          # GIT MEMORY PERSISTENCE
-          # ============================================================
-
-          def git_sync():
-              global memory_dirty
-
-              if not memory_dirty:
-                  return
-
-              if not os.environ.get("GITHUB_TOKEN"):
-                  return
-
-              with git_lock:
-                  try:
-                      subprocess.run(
-                          [
-                              "git",
-                              "add",
-                              str(MEMORY_FILE.relative_to(ROOT))
-                          ],
-                          cwd=ROOT,
-                          check=False,
-                          stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL
-                      )
-
-                      changed = subprocess.run(
-                          [
-                              "git",
-                              "diff",
-                              "--cached",
-                              "--quiet"
-                          ],
-                          cwd=ROOT,
-                          check=False
-                      )
-
-                      if changed.returncode == 0:
-                          memory_dirty = False
-                          return
-
-                      subprocess.run(
-                          [
-                              "git",
-                              "-c",
-                              "user.name=braincells-memory",
-                              "-c",
-                              "user.email=braincells-memory@users.noreply.github.com",
-                              "commit",
-                              "-m",
-                              "chore: persist tool memory"
-                          ],
-                          cwd=ROOT,
-                          check=False,
-                          stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL
-                      )
-
-                      auth_header = (
-                          "AUTHORIZATION: bearer "
-                          + os.environ["GITHUB_TOKEN"]
-                      )
-
-                      pushed = subprocess.run(
-                          [
-                              "git",
-                              "-c",
-                              f"http.extraheader={auth_header}",
-                              "push",
-                              "origin",
-                              "HEAD"
-                          ],
-                          cwd=ROOT,
-                          check=False,
-                          stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL
-                      )
-
-                      if pushed.returncode == 0:
-                          memory_dirty = False
-
-                  except Exception:
-                      pass
-
-
-          def memory_sync_loop():
-              while True:
-                  time.sleep(30)
-                  git_sync()
-
-
-          # ============================================================
-          # HTTP API
-          # ============================================================
-
-          class Handler(BaseHTTPRequestHandler):
-
-              def log_message(self, fmt, *args):
-                  print(
-                      "[HTTP]",
-                      fmt % args,
-                      flush=True
-                  )
-
-              def send_json(self, code, data):
-                  raw = json.dumps(
-                      data,
-                      ensure_ascii=False
-                  ).encode()
-
-                  self.send_response(code)
-                  self.send_header(
-                      "Content-Type",
-                      "application/json"
-                  )
-                  self.send_header(
-                      "Content-Length",
-                      str(len(raw))
-                  )
-                  self.end_headers()
-                  self.wfile.write(raw)
-
-              def authorized(self):
-                  if not API_KEY:
-                      return True
-
-                  auth = self.headers.get(
-                      "Authorization",
-                      ""
-                  )
-
-                  return auth == f"Bearer {API_KEY}"
-
-              def do_GET(self):
-                  if self.path == "/health":
-                      self.send_json(
-                          200,
-                          {
-                              "ok": True,
-                              "service": "tool-wielder",
-                              "model": MODEL,
-                              "memory_count": len(memories),
-                              "workspace": str(ROOT)
-                          }
-                      )
-                      return
-
-                  self.send_json(
-                      404,
-                      {"ok": False}
-                  )
-
-              def do_POST(self):
-                  if not self.authorized():
-                      self.send_json(
-                          401,
-                          {
-                              "ok": False,
-                              "error": "Unauthorized."
-                          }
-                      )
-                      return
-
-                  if self.path != "/v1/act":
-                      self.send_json(
-                          404,
-                          {"ok": False}
-                      )
-                      return
-
-                  try:
-                      length = int(
-                          self.headers.get(
-                              "Content-Length",
-                              "0"
-                          )
-                      )
-
-                      raw = self.rfile.read(length)
-
-                      body = json.loads(
-                          raw.decode(
-                              "utf-8",
-                              errors="replace"
-                          )
-                      )
-
-                      result = execute_request(
-                          body
-                      )
-
-                      self.send_json(
-                          200 if result.get("ok") else 400,
-                          result
-                      )
-
-                  except Exception as exc:
-                      self.send_json(
-                          500,
-                          {
-                              "ok": False,
-                              "error": str(exc)
-                          }
-                      )
-
-
-          # ============================================================
-          # STARTUP / SHUTDOWN
-          # ============================================================
-
-          load_memories()
-
-          print("========================================")
-          print(" MR. BRAINCELLS TOOL WIELDER")
-          print("========================================")
-          print(f"Model:     {MODEL}")
-          print(f"Workspace: {ROOT}")
-          print(f"Memory:    {MEMORY_FILE}")
-          print(f"Memories:  {len(memories)}")
-          print(f"Listen:    {HOST}:{PORT}")
-          print("========================================")
-
-
-          def shutdown(signum=None, frame=None):
-              print("Shutting down...")
-              git_sync()
-              raise SystemExit(0)
-
-
-          signal.signal(
-              signal.SIGTERM,
-              shutdown
-          )
-
-          signal.signal(
-              signal.SIGINT,
-              shutdown
-          )
-
-          threading.Thread(
-              target=memory_sync_loop,
-              daemon=True
-          ).start()
-
-          server = ThreadingHTTPServer(
-              (HOST, PORT),
-              Handler
-          )
-
-          server.serve_forever()
-          PY
-
-      # ------------------------------------------------------------
-      # START TOOL WIELDER
-      # ------------------------------------------------------------
       - name: Start Tool Wielder
         shell: bash
         run: |
-          nohup python3 tool_wielder.py > /tmp/tool-wielder.log 2>&1 &
+          set -euo pipefail
+
+          test -n "$TOOL_WIELDER_KEY" || {
+            echo "TOOL_WIELDER_KEY secret is missing"
+            exit 1
+          }
+
+          nohup python3 tool_wielder.py \
+            > /tmp/tool-wielder.log 2>&1 &
+
           echo $! > /tmp/tool-wielder.pid
 
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8765/health >/tmp/tool-health.json; then
-              echo "Tool Wielder is READY."
-              cat /tmp/tool-health.json
+          for i in $(seq 1 60); do
+            if curl -fsS \
+              -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
+              "http://127.0.0.1:${TOOL_PORT}/health" \
+              >/dev/null 2>&1; then
               break
             fi
+
             sleep 1
           done
 
-          echo
-          echo "========================================"
-          echo " TOOL WIELDER ENDPOINT"
-          echo "========================================"
-
-          TOOL_IP="$(tailscale ip -4)"
-
-          echo "http://${TOOL_IP}:8765"
-          echo
-          echo "POST http://${TOOL_IP}:8765/v1/act"
-          echo "GET  http://${TOOL_IP}:8765/health"
-          echo "========================================"
+          curl -fsS \
+            -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
+            "http://127.0.0.1:${TOOL_PORT}/health"
 
           echo
-          echo "Startup log:"
-          tail -n 40 /tmp/tool-wielder.log || true
+          echo "✓ Tool Wielder online"
+          echo "✓ Remote API: http://${TOOL_WIELDER_IP}:${TOOL_PORT}"
 
-      # ------------------------------------------------------------
-      # KEEP WORKFLOW ALIVE
-      # ------------------------------------------------------------
-      - name: Keep Tool Wielder alive
+      - name: Warm Tool Wielder and verify remote API
         shell: bash
         run: |
-          echo "Tool Wielder is running."
-          echo "Waiting for Main Agent requests..."
+          set -euo pipefail
+
+          echo "↳ Prewarming Qwen..."
+
+          WARM_RESPONSE="$(curl -fsS \
+            -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
+            "http://127.0.0.1:${TOOL_PORT}/warm")"
+
+          echo "$WARM_RESPONSE"
+
+          echo
+          echo "↳ Verifying authenticated /health..."
+
+          curl -fsS \
+            -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
+            "http://127.0.0.1:${TOOL_PORT}/health"
+
+          echo
+          echo "✓ Worker API verified"
+
+      - name: Keep workflow alive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo " TOOL WIELDER READY"
+          echo "========================================"
+
+          echo "Remote API:"
+          echo "http://${TOOL_WIELDER_IP}:${TOOL_PORT}"
+
+          echo "Model:"
+          echo "${TOOL_MODEL}"
+
+          echo "Workspace:"
+          echo "${GITHUB_WORKSPACE}"
+
+          echo "========================================"
+
+          trap 'exit 0' TERM INT
 
           while true; do
-            if ! kill -0 "$(cat /tmp/tool-wielder.pid)" 2>/dev/null; then
-              echo "Tool Wielder died."
-              echo
-              cat /tmp/tool-wielder.log || true
-              exit 1
-            fi
-
-            sleep 10
+            sleep 30
           done
