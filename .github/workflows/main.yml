@@ -1,10 +1,10 @@
-name: Mr. Braincells - Tool Wielder
+name: Mr. Braincells - Tool Wielder Type 2
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: braincells-tool-wielder
@@ -17,66 +17,125 @@ jobs:
 
     env:
       TOOL_MODEL: qwen3:1.7b
+
       OLLAMA_HOST: 127.0.0.1:11434
       OLLAMA_KEEP_ALIVE: 24h
       OLLAMA_NUM_PARALLEL: "1"
       OLLAMA_MAX_LOADED_MODELS: "1"
-      TOOL_HOST: 0.0.0.0
+
+      WORKER_LISTEN_HOST: 0.0.0.0
       TOOL_PORT: "8765"
-      MEMORY_FILE: data/tool_memory.jsonl
-      COMMAND_TIMEOUT: "180"
-      MAX_BODY: "2097152"
-      MAX_READ: "262144"
-      MAX_WEB_BYTES: "786432"
-      WEB_CACHE_TTL: "45"
-      WORKSPACE: ${{ github.workspace }}
       TOOL_WIELDER_KEY: ${{ secrets.TOOL_WIELDER_KEY }}
+
+      WORKSPACE: ${{ github.workspace }}
+      MEMORY_FILE: ${{ github.workspace }}/data/tool_memory.jsonl
+
+      QWEN_TIMEOUT: "180"
+      QWEN_CTX: "1024"
+      PREWARM: "0"
+
+      COMMAND_TIMEOUT: "180"
+      MAX_REQUEST_BODY: "8388608"
+      MAX_FILE_READ: "524288"
+      MAX_WEB_BYTES: "1048576"
+      WEB_CACHE_TTL: "45"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Install system tools
+      - name: Install worker dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y curl jq tree ripgrep python3
 
-      - name: Install Tailscale
+          retry() {
+            local attempts=0
+            local max_attempts=4
+
+            until "$@"; do
+              attempts=$((attempts + 1))
+
+              if [ "$attempts" -ge "$max_attempts" ]; then
+                echo "Command failed after ${attempts} attempts: $*" >&2
+                return 1
+              fi
+
+              echo "Retrying (${attempts}/${max_attempts})..." >&2
+              sleep 3
+            done
+          }
+
+          retry sudo apt-get update -y
+          retry sudo apt-get install -y curl jq tree ripgrep
+
+          python3 --version
+          curl --version | head -n1
+          git --version
+
+      - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
-          args: --hostname=braincells-tool-wielder-${{ github.run_id }}
           version: latest
+          log-mode: quiet
 
-      - name: Show Tailscale endpoint
+      - name: Verify Tailscale and publish worker endpoint
         shell: bash
         run: |
           set -euo pipefail
 
           TS_IP="$(tailscale ip -4 | head -n1)"
 
+          if [ -z "$TS_IP" ]; then
+            echo "Tailscale did not provide an IPv4 address." >&2
+            exit 1
+          fi
+
           echo "========================================"
           echo " TOOL WIELDER ONLINE"
           echo "========================================"
-
           echo "Tailscale IPv4:"
           echo "$TS_IP"
           echo
-
-          echo "Tailnet status:"
-          tailscale status || true
-          echo
-
           echo "API: http://${TS_IP}:${TOOL_PORT}"
           echo "========================================"
 
           echo "TOOL_WIELDER_IP=${TS_IP}" >> "$GITHUB_ENV"
+
+      - name: Verify Type 2 worker source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "braincells_type2.py" ]; then
+            echo "Missing required file: braincells_type2.py" >&2
+            echo "Commit the Type 2 Python file to the repository root." >&2
+            exit 1
+          fi
+
+          grep -Fq 'if self.path == "/warm":' braincells_type2.py || {
+            echo "braincells_type2.py is missing the /warm handler." >&2
+            exit 1
+          }
+
+          grep -Fq 'if self.path != "/v1/act":' braincells_type2.py || {
+            echo "braincells_type2.py is missing the /v1/act API." >&2
+            exit 1
+          }
+
+          grep -Fq 'if self.path != "/health":' braincells_type2.py || {
+            echo "braincells_type2.py is missing the /health endpoint." >&2
+            exit 1
+          }
+
+          python3 -m py_compile braincells_type2.py
+
+          echo "✓ Type 2 worker source validated"
 
       - name: Install Ollama
         shell: bash
@@ -102,208 +161,211 @@ jobs:
             ollama serve \
             > /tmp/ollama.log 2>&1 &
 
-          for i in $(seq 1 60); do
+          OLLAMA_PID=$!
+          echo "$OLLAMA_PID" > /tmp/ollama.pid
+
+          ready=0
+
+          for _ in $(seq 1 90); do
             if curl -fsS \
               "http://${OLLAMA_HOST}/api/tags" \
               >/dev/null 2>&1; then
+              ready=1
               break
             fi
 
             sleep 1
           done
 
-          curl -fsS \
-            "http://${OLLAMA_HOST}/api/tags" \
-            >/dev/null
+          if [ "$ready" -ne 1 ]; then
+            echo "Ollama failed to become ready." >&2
+            cat /tmp/ollama.log >&2 || true
+            exit 1
+          fi
 
           echo "✓ Ollama online"
 
-      - name: Pull Tool Wielder model
+      - name: Pull Qwen model
         shell: bash
         run: |
           set -euo pipefail
 
           ollama pull "$TOOL_MODEL"
 
-          echo "✓ $TOOL_MODEL available"
-
-      - name: Patch and validate Tool Wielder /warm endpoint
-        shell: python3 {0}
-        run: |
-          from pathlib import Path
+          python3 - "$TOOL_MODEL" <<'PY'
+          import json
+          import os
           import sys
+          import urllib.request
 
-          path = Path("tool_wielder.py")
+          model = sys.argv[1]
+          host = os.environ["OLLAMA_HOST"]
 
-          if not path.exists():
+          with urllib.request.urlopen(
+              f"http://{host}/api/tags",
+              timeout=20,
+          ) as response:
+              payload = json.load(response)
+
+          names = {
+              str(item.get("name", ""))
+              for item in payload.get("models", [])
+          }
+
+          if model not in names:
               raise SystemExit(
-                  "tool_wielder.py not found in repository root"
+                  f"Required model not listed: {model}"
               )
 
-          text = path.read_text(encoding="utf-8")
-
-          # Add /warm only when it doesn't already exist.
-          if 'self.path == "/warm"' not in text:
-
-              marker = '''        if self.path == "/health":\n'''
-
-              if marker not in text:
-                  raise SystemExit(
-                      "Could not locate Handler.do_GET() /health "
-                      "route in tool_wielder.py"
-                  )
-
-              warm_block = '''        if self.path == "/warm":
-            # Authenticated warm-up request.
-            # Sends a tiny request to Ollama and keeps Qwen loaded.
-            try:
-                qwen.post_json("/api/chat", {
-                    "model": QWEN_MODEL,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": "ping"
-                        }
-                    ],
-                    "stream": False,
-                    "think": False,
-                    "keep_alive": QWEN_KEEP_ALIVE,
-                    "options": {
-                        "num_ctx": 256,
-                        "num_predict": 1,
-                        "temperature": 0
-                    }
-                })
-
-                self._json(
-                    200,
-                    {
-                        "ok": True,
-                        "model": QWEN_MODEL,
-                        "warmed": True
-                    }
-                )
-
-            except Exception as exc:
-                self._json(
-                    502,
-                    {
-                        "ok": False,
-                        "error": (
-                            f"warm failed: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-                    }
-                )
-
-            return
-'''
-
-              text = text.replace(
-                  marker,
-                  warm_block + marker,
-                  1
-              )
-
-              path.write_text(
-                  text,
-                  encoding="utf-8"
-              )
-
-              print(
-                  "✓ Added authenticated GET /warm "
-                  "to tool_wielder.py"
-              )
-
-          else:
-              print("✓ /warm already exists in tool_wielder.py")
-
-          # Make sure the worker actually uses the secret.
-          if "TOOL_WIELDER_KEY" not in text:
-              raise SystemExit(
-                  "tool_wielder.py does not reference "
-                  "TOOL_WIELDER_KEY"
-              )
+          print(f"✓ {model} available")
+          PY
 
       - name: Start Tool Wielder
         shell: bash
         run: |
           set -euo pipefail
 
-          test -n "$TOOL_WIELDER_KEY" || {
-            echo "TOOL_WIELDER_KEY secret is missing"
+          if [ -z "${TOOL_WIELDER_KEY:-}" ]; then
+            echo "TOOL_WIELDER_KEY GitHub secret is missing or empty." >&2
             exit 1
-          }
+          fi
 
-          nohup python3 tool_wielder.py \
+          nohup python3 braincells_type2.py --worker \
             > /tmp/tool-wielder.log 2>&1 &
 
-          echo $! > /tmp/tool-wielder.pid
+          WORKER_PID=$!
+          echo "$WORKER_PID" > /tmp/tool-wielder.pid
 
-          for i in $(seq 1 60); do
+          ready=0
+
+          for _ in $(seq 1 90); do
             if curl -fsS \
               -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
               "http://127.0.0.1:${TOOL_PORT}/health" \
               >/dev/null 2>&1; then
+              ready=1
               break
+            fi
+
+            if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+              echo "Tool Wielder exited during startup." >&2
+              cat /tmp/tool-wielder.log >&2 || true
+              exit 1
             fi
 
             sleep 1
           done
 
-          curl -fsS \
-            -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
-            "http://127.0.0.1:${TOOL_PORT}/health"
+          if [ "$ready" -ne 1 ]; then
+            echo "Tool Wielder failed to become ready." >&2
+            cat /tmp/tool-wielder.log >&2 || true
+            exit 1
+          fi
 
-          echo
-          echo "✓ Tool Wielder online"
-          echo "✓ Remote API: http://${TOOL_WIELDER_IP}:${TOOL_PORT}"
+          echo "✓ Tool Wielder process ready"
 
-      - name: Warm Tool Wielder and verify remote API
+      - name: Exact API contract test
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "↳ Prewarming Qwen..."
+          echo "Testing authenticated GET /health..."
 
-          WARM_RESPONSE="$(curl -fsS \
+          HEALTH="$(curl -fsS \
             -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
-            "http://127.0.0.1:${TOOL_PORT}/warm")"
+            "http://127.0.0.1:${TOOL_PORT}/health")"
 
-          echo "$WARM_RESPONSE"
+          echo "$HEALTH"
 
           echo
-          echo "↳ Verifying authenticated /health..."
+          echo "Testing authenticated POST /warm..."
+
+          WARM="$(curl -fsS \
+            -X POST \
+            -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
+            -H "Content-Type: application/json" \
+            --data '{}' \
+            "http://127.0.0.1:${TOOL_PORT}/warm")"
+
+          echo "$WARM"
+
+          python3 - "$HEALTH" "$WARM" <<'PY'
+          import json
+          import sys
+
+          health = json.loads(sys.argv[1])
+          warm = json.loads(sys.argv[2])
+
+          if health.get("ok") is not True:
+              raise SystemExit(
+                  f"/health returned non-ok: {health}"
+              )
+
+          if (
+              warm.get("ok") is not True
+              or warm.get("warmed") is not True
+          ):
+              raise SystemExit(
+                  f"/warm returned non-ok: {warm}"
+              )
+
+          print("✓ /health passed")
+          print("✓ POST /warm passed")
+          PY
+
+      - name: Verify Tailscale-facing API
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Testing Tailscale GET /health..."
 
           curl -fsS \
             -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
-            "http://127.0.0.1:${TOOL_PORT}/health"
+            "http://${TOOL_WIELDER_IP}:${TOOL_PORT}/health"
 
           echo
-          echo "✓ Worker API verified"
+          echo
+          echo "Testing Tailscale POST /warm..."
+
+          curl -fsS \
+            -X POST \
+            -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
+            -H "Content-Type: application/json" \
+            --data '{}' \
+            "http://${TOOL_WIELDER_IP}:${TOOL_PORT}/warm"
+
+          echo
+          echo
+          echo "========================================"
+          echo " TOOL WIELDER VERIFIED"
+          echo "========================================"
+          echo "API:   http://${TOOL_WIELDER_IP}:${TOOL_PORT}"
+          echo "Model: ${TOOL_MODEL}"
+          echo "========================================"
 
       - name: Keep workflow alive
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "========================================"
-          echo " TOOL WIELDER READY"
-          echo "========================================"
-
-          echo "Remote API:"
-          echo "http://${TOOL_WIELDER_IP}:${TOOL_PORT}"
-
-          echo "Model:"
-          echo "${TOOL_MODEL}"
-
-          echo "Workspace:"
-          echo "${GITHUB_WORKSPACE}"
-
-          echo "========================================"
+          echo "Tool Wielder is ready."
 
           trap 'exit 0' TERM INT
 
           while true; do
+
+            if ! kill -0 "$(cat /tmp/ollama.pid)" 2>/dev/null; then
+              echo "Ollama process died." >&2
+              cat /tmp/ollama.log >&2 || true
+              exit 1
+            fi
+
+            if ! kill -0 "$(cat /tmp/tool-wielder.pid)" 2>/dev/null; then
+              echo "Tool Wielder process died." >&2
+              cat /tmp/tool-wielder.log >&2 || true
+              exit 1
+            fi
+
             sleep 30
           done
