@@ -1,10 +1,10 @@
-name: Mr. Braincells - Tool Wielder Type 2
+name: Mr. Braincells - Tool Wielder
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: braincells-tool-wielder
@@ -23,16 +23,15 @@ jobs:
       OLLAMA_NUM_PARALLEL: "1"
       OLLAMA_MAX_LOADED_MODELS: "1"
 
-      WORKER_LISTEN_HOST: 0.0.0.0
+      QWEN_CTX: "1024"
+      QWEN_TIMEOUT: "90"
+      PREWARM: "1"
+
       TOOL_PORT: "8765"
-      TOOL_WIELDER_KEY: ${{ secrets.TOOL_WIELDER_KEY }}
+      WORKER_LISTEN_HOST: 0.0.0.0
 
       WORKSPACE: ${{ github.workspace }}
       MEMORY_FILE: ${{ github.workspace }}/data/tool_memory.jsonl
-
-      QWEN_TIMEOUT: "180"
-      QWEN_CTX: "1024"
-      PREWARM: "0"
 
       COMMAND_TIMEOUT: "180"
       MAX_REQUEST_BODY: "8388608"
@@ -40,40 +39,13 @@ jobs:
       MAX_WEB_BYTES: "1048576"
       WEB_CACHE_TTL: "45"
 
+      TOOL_WIELDER_KEY: ${{ secrets.TOOL_WIELDER_KEY }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-
-      - name: Install worker dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          retry() {
-            local attempts=0
-            local max_attempts=4
-
-            until "$@"; do
-              attempts=$((attempts + 1))
-
-              if [ "$attempts" -ge "$max_attempts" ]; then
-                echo "Command failed after ${attempts} attempts: $*" >&2
-                return 1
-              fi
-
-              echo "Retrying (${attempts}/${max_attempts})..." >&2
-              sleep 3
-            done
-          }
-
-          retry sudo apt-get update -y
-          retry sudo apt-get install -y curl jq tree ripgrep
-
-          python3 --version
-          curl --version | head -n1
-          git --version
+          fetch-depth: 0
 
       - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
@@ -84,58 +56,17 @@ jobs:
           version: latest
           log-mode: quiet
 
-      - name: Verify Tailscale and publish worker endpoint
+      - name: Install runtime tools
         shell: bash
         run: |
           set -euo pipefail
 
-          TS_IP="$(tailscale ip -4 | head -n1)"
+          sudo apt-get update -y
+          sudo apt-get install -y curl jq tree ripgrep
 
-          if [ -z "$TS_IP" ]; then
-            echo "Tailscale did not provide an IPv4 address." >&2
-            exit 1
-          fi
-
-          echo "========================================"
-          echo " TOOL WIELDER ONLINE"
-          echo "========================================"
-          echo "Tailscale IPv4:"
-          echo "$TS_IP"
-          echo
-          echo "API: http://${TS_IP}:${TOOL_PORT}"
-          echo "========================================"
-
-          echo "TOOL_WIELDER_IP=${TS_IP}" >> "$GITHUB_ENV"
-
-      - name: Verify Type 2 worker source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -f "braincells_type2.py" ]; then
-            echo "Missing required file: braincells_type2.py" >&2
-            echo "Commit the Type 2 Python file to the repository root." >&2
-            exit 1
-          fi
-
-          grep -Fq 'if self.path == "/warm":' braincells_type2.py || {
-            echo "braincells_type2.py is missing the /warm handler." >&2
-            exit 1
-          }
-
-          grep -Fq 'if self.path != "/v1/act":' braincells_type2.py || {
-            echo "braincells_type2.py is missing the /v1/act API." >&2
-            exit 1
-          }
-
-          grep -Fq 'if self.path != "/health":' braincells_type2.py || {
-            echo "braincells_type2.py is missing the /health endpoint." >&2
-            exit 1
-          }
-
-          python3 -m py_compile braincells_type2.py
-
-          echo "✓ Type 2 worker source validated"
+          python3 --version
+          curl --version | head -n1
+          git --version
 
       - name: Install Ollama
         shell: bash
@@ -161,8 +92,7 @@ jobs:
             ollama serve \
             > /tmp/ollama.log 2>&1 &
 
-          OLLAMA_PID=$!
-          echo "$OLLAMA_PID" > /tmp/ollama.pid
+          echo $! > /tmp/ollama.pid
 
           ready=0
 
@@ -185,56 +115,173 @@ jobs:
 
           echo "✓ Ollama online"
 
-      - name: Pull Qwen model
+      - name: Pull Qwen Tool Brain
         shell: bash
         run: |
           set -euo pipefail
 
           ollama pull "$TOOL_MODEL"
 
-          python3 - "$TOOL_MODEL" <<'PY'
-          import json
-          import os
-          import sys
-          import urllib.request
+          curl -fsS \
+            "http://${OLLAMA_HOST}/api/tags" |
+            jq -e --arg model "$TOOL_MODEL" \
+            '.models | map(.name) | index($model) != null' \
+            >/dev/null
 
-          model = sys.argv[1]
-          host = os.environ["OLLAMA_HOST"]
+          echo "✓ $TOOL_MODEL available"
 
-          with urllib.request.urlopen(
-              f"http://{host}/api/tags",
-              timeout=20,
-          ) as response:
-              payload = json.load(response)
+      - name: Materialize full Tool Wielder
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          names = {
-              str(item.get("name", ""))
-              for item in payload.get("models", [])
-          }
+          cat > /tmp/worker_payload.b64 <<'BRAIN_CELLS_PAYLOAD'
+          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
+          ... 
+          BRAIN_CELLS_PAYLOAD
 
-          if model not in names:
-              raise SystemExit(
-                  f"Required model not listed: {model}"
-              )
+          base64 -d /tmp/worker_payload.b64 | gzip -d > /tmp/braincells_worker.py
+          chmod 700 /tmp/braincells_worker.py
 
-          print(f"✓ {model} available")
-          PY
+          python3 -m py_compile /tmp/braincells_worker.py
+
+          echo "✓ Full Worker materialized"
+          echo "✓ Python syntax verified"
+
+      - name: Validate Tool Wielder key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TOOL_WIELDER_KEY:-}" ]; then
+            echo "TOOL_WIELDER_KEY is missing."
+            exit 1
+          fi
+
+          echo "✓ TOOL_WIELDER_KEY present"
 
       - name: Start Tool Wielder
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -z "${TOOL_WIELDER_KEY:-}" ]; then
-            echo "TOOL_WIELDER_KEY GitHub secret is missing or empty." >&2
-            exit 1
-          fi
+          nohup python3 /tmp/braincells_worker.py --worker \
+            >/tmp/tool-wielder.log 2>&1 &
 
-          nohup python3 braincells_type2.py --worker \
-            > /tmp/tool-wielder.log 2>&1 &
-
-          WORKER_PID=$!
-          echo "$WORKER_PID" > /tmp/tool-wielder.pid
+          echo $! > /tmp/tool-wielder.pid
 
           ready=0
 
@@ -247,8 +294,8 @@ jobs:
               break
             fi
 
-            if ! kill -0 "$WORKER_PID" 2>/dev/null; then
-              echo "Tool Wielder exited during startup." >&2
+            if ! kill -0 "$(cat /tmp/tool-wielder.pid)" 2>/dev/null; then
+              echo "Tool Wielder exited." >&2
               cat /tmp/tool-wielder.log >&2 || true
               exit 1
             fi
@@ -257,28 +304,31 @@ jobs:
           done
 
           if [ "$ready" -ne 1 ]; then
-            echo "Tool Wielder failed to become ready." >&2
+            echo "Tool Wielder failed to start." >&2
             cat /tmp/tool-wielder.log >&2 || true
             exit 1
           fi
 
-          echo "✓ Tool Wielder process ready"
+          echo "✓ Tool Wielder HTTP server online"
 
-      - name: Exact API contract test
+      - name: Test Tool Wielder API
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Testing authenticated GET /health..."
+          echo "========== /health =========="
 
           HEALTH="$(curl -fsS \
             -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
             "http://127.0.0.1:${TOOL_PORT}/health")"
 
-          echo "$HEALTH"
+          echo "$HEALTH" | jq .
+          echo "$HEALTH" |
+            jq -e '.ok == true and .service == "tool-wielder"' \
+            >/dev/null
 
           echo
-          echo "Testing authenticated POST /warm..."
+          echo "========== POST /warm =========="
 
           WARM="$(curl -fsS \
             -X POST \
@@ -287,82 +337,92 @@ jobs:
             --data '{}' \
             "http://127.0.0.1:${TOOL_PORT}/warm")"
 
-          echo "$WARM"
+          echo "$WARM" | jq .
+          echo "$WARM" |
+            jq -e '.ok == true and .warmed == true' \
+            >/dev/null
 
-          python3 - "$HEALTH" "$WARM" <<'PY'
-          import json
-          import sys
+          echo
+          echo "✓ GET /health passed"
+          echo "✓ POST /warm passed"
 
-          health = json.loads(sys.argv[1])
-          warm = json.loads(sys.argv[2])
-
-          if health.get("ok") is not True:
-              raise SystemExit(
-                  f"/health returned non-ok: {health}"
-              )
-
-          if (
-              warm.get("ok") is not True
-              or warm.get("warmed") is not True
-          ):
-              raise SystemExit(
-                  f"/warm returned non-ok: {warm}"
-              )
-
-          print("✓ /health passed")
-          print("✓ POST /warm passed")
-          PY
-
-      - name: Verify Tailscale-facing API
+      - name: Publish Tailscale endpoint
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Testing Tailscale GET /health..."
+          TS_IP="$(tailscale ip -4 | head -n1)"
+
+          if [ -z "$TS_IP" ]; then
+            echo "Could not determine Tailscale IPv4."
+            exit 1
+          fi
+
+          echo "TOOL_WIELDER_IP=${TS_IP}" >> "$GITHUB_ENV"
+
+          echo "========================================"
+          echo " TOOL WIELDER ONLINE"
+          echo "========================================"
+          echo "Tailscale IPv4:"
+          echo "$TS_IP"
+          echo
+          echo "API:"
+          echo "http://${TS_IP}:${TOOL_PORT}"
+          echo
+          echo "Model:"
+          echo "${TOOL_MODEL}"
+          echo "========================================"
+
+      - name: Verify remote Tailscale API
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========== REMOTE /health =========="
 
           curl -fsS \
             -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
-            "http://${TOOL_WIELDER_IP}:${TOOL_PORT}/health"
+            "http://${TOOL_WIELDER_IP}:${TOOL_PORT}/health" |
+            jq .
 
           echo
-          echo
-          echo "Testing Tailscale POST /warm..."
+          echo "========== REMOTE POST /warm =========="
 
           curl -fsS \
             -X POST \
             -H "Authorization: Bearer ${TOOL_WIELDER_KEY}" \
             -H "Content-Type: application/json" \
             --data '{}' \
-            "http://${TOOL_WIELDER_IP}:${TOOL_PORT}/warm"
+            "http://${TOOL_WIELDER_IP}:${TOOL_PORT}/warm" |
+            jq .
 
           echo
-          echo
-          echo "========================================"
-          echo " TOOL WIELDER VERIFIED"
-          echo "========================================"
-          echo "API:   http://${TOOL_WIELDER_IP}:${TOOL_PORT}"
-          echo "Model: ${TOOL_MODEL}"
-          echo "========================================"
+          echo "✓ Remote /health passed"
+          echo "✓ Remote POST /warm passed"
 
-      - name: Keep workflow alive
+      - name: Keep Worker alive
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Tool Wielder is ready."
+          echo "========================================"
+          echo " TOOL WIELDER READY"
+          echo "========================================"
+          echo "Endpoint: http://${TOOL_WIELDER_IP}:${TOOL_PORT}"
+          echo "Model:    ${TOOL_MODEL}"
+          echo "========================================"
 
           trap 'exit 0' TERM INT
 
           while true; do
-
             if ! kill -0 "$(cat /tmp/ollama.pid)" 2>/dev/null; then
-              echo "Ollama process died." >&2
+              echo "Ollama died." >&2
               cat /tmp/ollama.log >&2 || true
               exit 1
             fi
 
             if ! kill -0 "$(cat /tmp/tool-wielder.pid)" 2>/dev/null; then
-              echo "Tool Wielder process died." >&2
+              echo "Tool Wielder died." >&2
               cat /tmp/tool-wielder.log >&2 || true
               exit 1
             fi
