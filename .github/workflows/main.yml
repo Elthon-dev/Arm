@@ -65,8 +65,16 @@ jobs:
           echo "TOOL WIELDER ONLINE"
           echo "======================================"
 
-          tailscale ip -4
+          tailscale ip -4 | head -1 > /tmp/tw-ip.txt
+          cat /tmp/tw-ip.txt
           tailscale status
+
+      - name: Upload endpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-endpoint
+          path: /tmp/tw-ip.txt
+          if-no-files-found: error
 
       - name: Preflight v6 worker
         shell: bash
