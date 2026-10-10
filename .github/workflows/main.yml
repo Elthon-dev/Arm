@@ -14,6 +14,12 @@ jobs:
     env:
       OLLAMA_MODEL: qwen3:1.7b
       TOOL_WIELDER_KEY: ${{ secrets.TOOL_WIELDER_KEY }}
+      TOOL_PORT: '8765'
+      WORKER_LISTEN_HOST: '0.0.0.0'
+      QWEN_HOST: '127.0.0.1:11434'
+      QWEN_MODEL: qwen3:1.7b
+      WORKSPACE: ${{ github.workspace }}
+      PREWARM: '1'
 
     steps:
       - name: Checkout
@@ -62,281 +68,30 @@ jobs:
           tailscale ip -4
           tailscale status
 
-      - name: Create Tool Wielder server
+      - name: Preflight v6 worker
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/tool_wielder.py <<'PY'
-          import json
-          import os
-          import subprocess
-          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-          from pathlib import Path
-          from urllib.request import Request, urlopen
+          ls -la braincells_type2_v6.py
+          python3 -m py_compile braincells_type2_v6.py
+          python3 --version
 
-          HOST = "0.0.0.0"
-          PORT = 8765
-
-          MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
-          API_KEY = os.environ.get("TOOL_WIELDER_KEY", "")
-
-          ROOT = Path.cwd().resolve()
-
-          def authorized(handler):
-              auth = handler.headers.get("Authorization", "")
-              return bool(API_KEY) and auth == f"Bearer {API_KEY}"
-
-          def send(handler, status, data):
-              raw = json.dumps(data).encode()
-
-              handler.send_response(status)
-              handler.send_header("Content-Type", "application/json")
-              handler.send_header("Content-Length", str(len(raw)))
-              handler.end_headers()
-              handler.wfile.write(raw)
-
-          def body(handler):
-              length = int(handler.headers.get("Content-Length", "0"))
-              raw = handler.rfile.read(length)
-
-              if not raw:
-                  return {}
-
-              return json.loads(raw.decode())
-
-          def ollama_chat(messages):
-              payload = {
-                  "model": MODEL,
-                  "messages": messages,
-                  "stream": False
-              }
-
-              req = Request(
-                  "http://127.0.0.1:11434/api/chat",
-                  data=json.dumps(payload).encode(),
-                  headers={"Content-Type": "application/json"}
-              )
-
-              with urlopen(req, timeout=300) as r:
-                  return json.loads(r.read().decode())
-
-          def safe_path(value):
-              p = (ROOT / value).resolve()
-
-              if p != ROOT and ROOT not in p.parents:
-                  raise ValueError("path outside workspace")
-
-              return p
-
-          class Handler(BaseHTTPRequestHandler):
-
-              def log_message(self, fmt, *args):
-                  print(f"[HTTP] {self.address_string()} - {fmt % args}")
-
-              def do_GET(self):
-                  if not authorized(self):
-                      return send(self, 401, {
-                          "ok": False,
-                          "error": "unauthorized"
-                      })
-
-                  if self.path == "/health":
-                      return send(self, 200, {
-                          "ok": True,
-                          "service": "tool-wielder",
-                          "model": MODEL,
-                          "workspace": str(ROOT)
-                      })
-
-                  if self.path == "/help":
-                      return send(self, 200, {
-                          "ok": True,
-                          "actions": [
-                              "chat",
-                              "run",
-                              "read_file",
-                              "write_file",
-                              "append_file",
-                              "list_files"
-                          ]
-                      })
-
-                  if self.path == "/config":
-                      return send(self, 200, {
-                          "ok": True,
-                          "model": MODEL,
-                          "workspace": str(ROOT)
-                      })
-
-                  return send(self, 404, {
-                      "ok": False,
-                      "error": "not found"
-                  })
-
-              def do_POST(self):
-                  if not authorized(self):
-                      return send(self, 401, {
-                          "ok": False,
-                          "error": "unauthorized"
-                      })
-
-                  try:
-                      data = body(self)
-
-                      if self.path == "/warm":
-                          result = ollama_chat([
-                              {
-                                  "role": "user",
-                                  "content": "Reply with exactly: READY"
-                              }
-                          ])
-
-                          return send(self, 200, {
-                              "ok": True,
-                              "model": MODEL,
-                              "response": result
-                          })
-
-                      if self.path == "/reset":
-                          return send(self, 200, {
-                              "ok": True,
-                              "message": "session reset"
-                          })
-
-                      if self.path == "/v1/act":
-                          action = data.get("action")
-
-                          if action == "chat":
-                              messages = data.get("messages", [])
-
-                              result = ollama_chat(messages)
-
-                              return send(self, 200, {
-                                  "ok": True,
-                                  "result": result
-                              })
-
-                          if action == "run":
-                              command = data.get("command", "")
-
-                              if not command:
-                                  raise ValueError("missing command")
-
-                              result = subprocess.run(
-                                  command,
-                                  shell=True,
-                                  cwd=ROOT,
-                                  capture_output=True,
-                                  text=True,
-                                  timeout=300
-                              )
-
-                              return send(self, 200, {
-                                  "ok": result.returncode == 0,
-                                  "returncode": result.returncode,
-                                  "stdout": result.stdout,
-                                  "stderr": result.stderr
-                              })
-
-                          if action == "read_file":
-                              path = safe_path(data["path"])
-
-                              return send(self, 200, {
-                                  "ok": True,
-                                  "path": str(path.relative_to(ROOT)),
-                                  "content": path.read_text(
-                                      encoding="utf-8",
-                                      errors="replace"
-                                  )
-                              })
-
-                          if action == "write_file":
-                              path = safe_path(data["path"])
-                              path.parent.mkdir(parents=True, exist_ok=True)
-
-                              path.write_text(
-                                  data.get("content", ""),
-                                  encoding="utf-8"
-                              )
-
-                              return send(self, 200, {
-                                  "ok": True,
-                                  "path": str(path.relative_to(ROOT))
-                              })
-
-                          if action == "append_file":
-                              path = safe_path(data["path"])
-                              path.parent.mkdir(parents=True, exist_ok=True)
-
-                              with path.open("a", encoding="utf-8") as f:
-                                  f.write(data.get("content", ""))
-
-                              return send(self, 200, {
-                                  "ok": True,
-                                  "path": str(path.relative_to(ROOT))
-                              })
-
-                          if action == "list_files":
-                              path = safe_path(data.get("path", "."))
-
-                              files = []
-
-                              for p in sorted(path.rglob("*")):
-                                  files.append(
-                                      str(p.relative_to(ROOT))
-                                  )
-
-                                  if len(files) >= 500:
-                                      break
-
-                              return send(self, 200, {
-                                  "ok": True,
-                                  "files": files
-                              })
-
-                          raise ValueError(
-                              f"unknown action: {action}"
-                          )
-
-                      return send(self, 404, {
-                          "ok": False,
-                          "error": "not found"
-                      })
-
-                  except Exception as e:
-                      return send(self, 500, {
-                          "ok": False,
-                          "error": str(e)
-                      })
-
-
-          print("======================================")
-          print("TOOL WIELDER STARTING")
-          print("======================================")
-          print(f"Model:     {MODEL}")
-          print(f"Workspace: {ROOT}")
-          print(f"API:       http://0.0.0.0:{PORT}")
-          print("======================================")
-
-          ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
-          PY
-
-      - name: Start Tool Wielder
+      - name: Start Tool Wielder (v6)
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 /tmp/tool_wielder.py &
+          python3 "$GITHUB_WORKSPACE/braincells_type2_v6.py" --worker &
           SERVER_PID=$!
 
-          sleep 5
+          sleep 6
 
           IP="$(tailscale ip -4)"
 
           echo
           echo "======================================"
-          echo "TOOL WIELDER ONLINE"
+          echo "TOOL WIELDER (v6) ONLINE"
           echo "======================================"
           echo "Tailscale IPv4: $IP"
           echo "API: http://$IP:8765"
@@ -350,16 +105,12 @@ jobs:
             "http://127.0.0.1:8765/health"
 
           echo
-          echo "Warming model..."
-
+          echo "Review check:"
           curl -fsS \
-            -X POST \
             -H "Authorization: Bearer $TOOL_WIELDER_KEY" \
-            -H "Content-Type: application/json" \
-            -d '{}' \
-            "http://127.0.0.1:8765/warm"
+            "http://127.0.0.1:8765/help" \
+            | grep -o '"review"' || echo "review check inconclusive"
 
-          echo
           echo "======================================"
           echo "SERVER READY"
           echo "======================================"
